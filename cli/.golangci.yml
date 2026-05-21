@@ -1,0 +1,29 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - bodyclose
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - errorlint
+    - contextcheck
+  settings:
+    errcheck:
+      check-type-assertions: true
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+
+formatters:
+  enable:
+    - gofmt
+
+run:
+  timeout: 5m

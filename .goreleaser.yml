@@ -1,0 +1,48 @@
+version: 2
+
+project_name: wd-extract
+
+builds:
+  - id: wd-extract
+    dir: cli
+    main: ./cmd/wd-extract
+    binary: wd-extract
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: wd-extract
+    ids:
+      - wd-extract
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "wd-extract_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
+
+checksum:
+  name_template: "wd-extract_checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+release:
+  github:
+    owner: nickwhiteley
+    name: data-api
