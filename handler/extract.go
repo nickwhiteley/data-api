@@ -20,7 +20,7 @@ import (
 // Config holds library-level configuration for the handler.
 type Config struct {
 	// Schema is the PostgreSQL schema name for all extraction queries.
-	// Defaults to "wd" if empty.
+	// When empty, table names are unqualified and rely on the session search_path.
 	Schema string
 	// RequiredScope is the API key scope checked on every extraction request.
 	// Defaults to "data_engineer" if empty.
@@ -41,8 +41,8 @@ type ExtractHandler struct {
 // cfg supplies runtime config values; implementations should read from a live source.
 func NewHandler(pool *pgxpool.Pool, auth AuthContext, cfg DataConfig, config Config) *ExtractHandler {
 	schema := config.Schema
-	if schema == "" {
-		schema = "wd"
+	if schema != "" {
+		schema = schema + "."
 	}
 	requiredScope := config.RequiredScope
 	if requiredScope == "" {
@@ -405,7 +405,7 @@ func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) 
 		var role string
 		// #nosec G201 — schema is library-configured, not user input
 		err := h.pool.QueryRow(ctx,
-			fmt.Sprintf(`SELECT role FROM %s.user_org
+			fmt.Sprintf(`SELECT role FROM %suser_org
 			 WHERE user_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 			   AND role IN ('data_engineer', 'tenant_admin', 'platform_admin')
 			 LIMIT 1`, h.schema),
@@ -503,7 +503,7 @@ func (h *ExtractHandler) ListExecutions(w http.ResponseWriter, r *http.Request) 
 		// Session auth — look up role from DB.
 		// #nosec G201 — schema is library-configured, not user input
 		_ = h.pool.QueryRow(ctx,
-			fmt.Sprintf(`SELECT role FROM %s.user_org
+			fmt.Sprintf(`SELECT role FROM %suser_org
 			 WHERE user_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 			 LIMIT 1`, h.schema),
 			userID, tenantID,

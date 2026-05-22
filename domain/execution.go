@@ -28,7 +28,7 @@ type InsertPendingInput struct {
 // Uses an advisory lock to ensure idempotency under concurrent page-1 retries.
 // Returns execution ID (never empty on nil error).
 func InsertOrReusePending(ctx context.Context, pool *pgxpool.Pool, input InsertPendingInput) (string, error) {
-	execTable := input.Schema + ".data_extraction_execution"
+	execTable := input.Schema + "data_extraction_execution"
 
 	lockKey := fmt.Sprintf("%s:%s", input.UserID, input.TableName)
 
@@ -87,7 +87,7 @@ func InsertOrReusePending(ctx context.Context, pool *pgxpool.Pool, input InsertP
 
 // TransitionStarted moves a pending execution to started.
 func TransitionStarted(ctx context.Context, pool *pgxpool.Pool, schema, execID string) error {
-	execTable := schema + ".data_extraction_execution"
+	execTable := schema + "data_extraction_execution"
 	// #nosec G201 — schema is library-configured, not user input
 	tag, err := pool.Exec(ctx, fmt.Sprintf(`
 		UPDATE %s
@@ -115,7 +115,7 @@ type TransitionCompletedInput struct {
 
 // TransitionCompleted moves a started/pending execution to completed.
 func TransitionCompleted(ctx context.Context, pool *pgxpool.Pool, input TransitionCompletedInput) error {
-	execTable := input.Schema + ".data_extraction_execution"
+	execTable := input.Schema + "data_extraction_execution"
 	// #nosec G201 — schema is library-configured, not user input
 	tag, err := pool.Exec(ctx, fmt.Sprintf(`
 		UPDATE %s
@@ -147,7 +147,7 @@ type InsertResetInput struct {
 
 // InsertReset inserts a reset cursor row. Returns the new execution ID.
 func InsertReset(ctx context.Context, pool *pgxpool.Pool, input InsertResetInput) (string, error) {
-	execTable := input.Schema + ".data_extraction_execution"
+	execTable := input.Schema + "data_extraction_execution"
 	var execID string
 	// #nosec G201 — schema is library-configured, not user input
 	if err := pool.QueryRow(ctx, fmt.Sprintf(`
@@ -166,7 +166,7 @@ func InsertReset(ctx context.Context, pool *pgxpool.Pool, input InsertResetInput
 // CursorFor returns the most recent end_at for the user+table (completed or reset rows).
 // Returns 2000-01-01 00:00:00 UTC if no row found.
 func CursorFor(ctx context.Context, pool *pgxpool.Pool, schema, userID, tableName string) (time.Time, error) {
-	execTable := schema + ".data_extraction_execution"
+	execTable := schema + "data_extraction_execution"
 	var endAt time.Time
 	// #nosec G201 — schema is library-configured, not user input
 	err := pool.QueryRow(ctx, fmt.Sprintf(`
@@ -190,7 +190,7 @@ func CursorFor(ctx context.Context, pool *pgxpool.Pool, schema, userID, tableNam
 
 // CurrentExtractionCount counts started+completed current extractions today for user+table.
 func CurrentExtractionCount(ctx context.Context, pool *pgxpool.Pool, schema, userID, tableName string) (int, error) {
-	execTable := schema + ".data_extraction_execution"
+	execTable := schema + "data_extraction_execution"
 	var count int
 	// #nosec G201 — schema is library-configured, not user input
 	if err := pool.QueryRow(ctx, fmt.Sprintf(`
@@ -225,7 +225,7 @@ type Execution struct {
 // GetExecutionByID returns the execution record for the given ID scoped to the user.
 // Returns ErrNotFound if not found or the row belongs to a different user.
 func GetExecutionByID(ctx context.Context, pool *pgxpool.Pool, schema, execID, userID string) (Execution, error) {
-	execTable := schema + ".data_extraction_execution"
+	execTable := schema + "data_extraction_execution"
 	var e Execution
 	// #nosec G201 — schema is library-configured, not user input
 	err := pool.QueryRow(ctx, fmt.Sprintf(`
@@ -286,7 +286,7 @@ func ListExecutions(ctx context.Context, pool *pgxpool.Pool, input ListExecution
 		input.PerPage = 100
 	}
 
-	execTable := input.Schema + ".data_extraction_execution"
+	execTable := input.Schema + "data_extraction_execution"
 
 	args := []any{input.TenantID}
 	where := "WHERE tenant_id = $1 AND deleted_at IS NULL"

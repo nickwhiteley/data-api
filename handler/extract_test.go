@@ -165,8 +165,9 @@ func TestNewHandler_InterfaceSatisfaction(t *testing.T) {
 func TestNewHandler_DefaultSchema(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(nil, stubAuth{}, stubConfig{}, Config{})
-	if h.schema != "wd" {
-		t.Errorf("expected default schema 'wd', got %q", h.schema)
+	// Empty schema = no qualification; host app relies on search_path.
+	if h.schema != "" {
+		t.Errorf("expected empty schema for zero config, got %q", h.schema)
 	}
 	if h.requiredScope != "data_engineer" {
 		t.Errorf("expected default scope 'data_engineer', got %q", h.requiredScope)
@@ -176,8 +177,9 @@ func TestNewHandler_DefaultSchema(t *testing.T) {
 func TestNewHandler_ExplicitConfig(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(nil, stubAuth{}, stubConfig{}, Config{Schema: "core", RequiredScope: "mop_data_engineer"})
-	if h.schema != "core" {
-		t.Errorf("expected schema 'core', got %q", h.schema)
+	// Schema is stored with trailing dot so table refs are "core.tablename".
+	if h.schema != "core." {
+		t.Errorf("expected schema 'core.', got %q", h.schema)
 	}
 	if h.requiredScope != "mop_data_engineer" {
 		t.Errorf("expected scope 'mop_data_engineer', got %q", h.requiredScope)

@@ -26,11 +26,12 @@ type ExtractWindowInput struct {
 // This prevents injection and gives a clean 404 for non-existent tables.
 func ValidateTable(ctx context.Context, pool *pgxpool.Pool, schema, tableName string) error {
 	var exists bool
+	schemaName := strings.TrimSuffix(schema, ".")
 	err := pool.QueryRow(ctx,
 		`SELECT EXISTS(
             SELECT 1 FROM information_schema.tables
-            WHERE table_schema = $1 AND table_name = $2
-        )`, schema, tableName+"_log",
+            WHERE table_schema = COALESCE(NULLIF($1, ''), current_schema()) AND table_name = $2
+        )`, schemaName, tableName+"_log",
 	).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("validate table %s: %w", tableName, err)
@@ -44,9 +45,10 @@ func ValidateTable(ctx context.Context, pool *pgxpool.Pool, schema, tableName st
 // ValidateBaseTable returns ErrNotFound if {schema}.{tableName} does not exist.
 func ValidateBaseTable(ctx context.Context, pool *pgxpool.Pool, schema, tableName string) error {
 	var exists bool
+	schemaName := strings.TrimSuffix(schema, ".")
 	err := pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)`,
-		schema, tableName,
+		`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = COALESCE(NULLIF($1, ''), current_schema()) AND table_name = $2)`,
+		schemaName, tableName,
 	).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("validate base table %s: %w", tableName, err)
@@ -66,10 +68,10 @@ type ExtractCurrentInput struct {
 	PageNumber int
 }
 
-// ExtractCurrent runs a paginated query against {schema}.{tableName} (base table, not log).
+// ExtractCurrent runs a paginated query against {schema}{tableName} (base table, not log).
 // Returns non-deleted rows ordered by primary key for consistent pagination.
 func ExtractCurrent(ctx context.Context, pool *pgxpool.Pool, input ExtractCurrentInput) (pgx.Rows, error) {
-	table := input.Schema + "." + input.TableName
+	table := input.Schema + input.TableName
 	offset := (input.PageNumber - 1) * input.RowCount
 	// #nosec G201 — tableName validated against information_schema before this call; schema is library-configured.
 	query := fmt.Sprintf(
@@ -93,30 +95,31 @@ type TableInfo struct {
 // with a tenant_id column, excluding denied tables and data_extraction_execution_log.
 // The tenant_id requirement excludes platform-wide tables that cannot be safely filtered per-tenant.
 func DiscoverTables(ctx context.Context, pool *pgxpool.Pool, schema string) ([]TableInfo, error) {
+	schemaName := strings.TrimSuffix(schema, ".")
 	rows, err := pool.Query(ctx, `
 		SELECT
 		    t.table_name,
 		    COALESCE(obj_description(pc.oid, 'pg_class'), '') AS description
 		FROM information_schema.tables t
 		JOIN information_schema.tables base
-		    ON base.table_schema = $1
+		    ON base.table_schema = COALESCE(NULLIF($1, ''), current_schema())
 		   AND base.table_name = regexp_replace(t.table_name, '_log$', '')
 		JOIN information_schema.columns tc
-		    ON tc.table_schema = $1
+		    ON tc.table_schema = COALESCE(NULLIF($1, ''), current_schema())
 		   AND tc.table_name = regexp_replace(t.table_name, '_log$', '')
 		   AND tc.column_name = 'tenant_id'
 		LEFT JOIN pg_catalog.pg_class pc
 		    ON pc.relname = t.table_name
-		   AND pc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
-		WHERE t.table_schema = $1
+		   AND pc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = COALESCE(NULLIF($1, ''), current_schema()))
+		WHERE t.table_schema = COALESCE(NULLIF($1, ''), current_schema())
 		  AND t.table_name LIKE '%_log'
 		  AND t.table_name != 'data_extraction_execution_log'
 		  AND NOT EXISTS (
-		      SELECT 1 FROM ` + schema + `.data_extraction_deny d
+		      SELECT 1 FROM ` + schema + `data_extraction_deny d
 		      WHERE d.table_name = regexp_replace(t.table_name, '_log$', '')
 		        AND d.deleted_at IS NULL
 		  )
-		ORDER BY t.table_name ASC`, schema,
+		ORDER BY t.table_name ASC`, schemaName,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("discover tables: %w", err)
@@ -136,11 +139,11 @@ func DiscoverTables(ctx context.Context, pool *pgxpool.Pool, schema string) ([]T
 	return tables, rows.Err()
 }
 
-// ExtractWindow runs a paginated window query against {schema}.{tableName}_log.
+// ExtractWindow runs a paginated window query against {schema}{tableName}_log.
 // Returns pgx.Rows so the handler can stream-serialise via Serialise().
 // Caller must close rows.
 func ExtractWindow(ctx context.Context, pool *pgxpool.Pool, input ExtractWindowInput) (pgx.Rows, error) {
-	table := input.Schema + "." + input.TableName + "_log"
+	table := input.Schema + input.TableName + "_log"
 	offset := (input.PageNumber - 1) * input.RowCount
 
 	// #nosec G201 — tableName validated against information_schema before this call; schema is library-configured.

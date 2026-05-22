@@ -69,7 +69,7 @@ func IsDenied(ctx context.Context, pool *pgxpool.Pool, schema, tableName string)
 	if IsHardBlocked(base) {
 		return true, nil
 	}
-	denyTable := schema + ".data_extraction_deny"
+	denyTable := schema + "data_extraction_deny"
 	var exists bool
 	// #nosec G201 — schema is library-configured, not user input
 	if err := pool.QueryRow(ctx, fmt.Sprintf(`
@@ -85,7 +85,7 @@ func IsDenied(ctx context.Context, pool *pgxpool.Pool, schema, tableName string)
 
 // ListDenied returns all active deny entries.
 func ListDenied(ctx context.Context, pool *pgxpool.Pool, schema string) ([]DenyEntry, error) {
-	denyTable := schema + ".data_extraction_deny"
+	denyTable := schema + "data_extraction_deny"
 	// #nosec G201 — schema is library-configured, not user input
 	rows, err := pool.Query(ctx, fmt.Sprintf(`
 		SELECT data_extraction_deny_id, table_name, inserted_by, inserted_at
@@ -121,7 +121,7 @@ type AddDenyInput struct {
 
 // AddDeny adds a table to the deny list. Returns ErrDenyConflict if already active.
 func AddDeny(ctx context.Context, pool *pgxpool.Pool, input AddDenyInput) (DenyEntry, error) {
-	denyTable := input.Schema + ".data_extraction_deny"
+	denyTable := input.Schema + "data_extraction_deny"
 	var e DenyEntry
 	// #nosec G201 — schema is library-configured, not user input
 	err := pool.QueryRow(ctx, fmt.Sprintf(`
@@ -142,7 +142,7 @@ func AddDeny(ctx context.Context, pool *pgxpool.Pool, input AddDenyInput) (DenyE
 
 // RemoveDeny soft-deletes the deny entry for the given table. Returns ErrNotFound if not active.
 func RemoveDeny(ctx context.Context, pool *pgxpool.Pool, schema, tableName string) error {
-	denyTable := schema + ".data_extraction_deny"
+	denyTable := schema + "data_extraction_deny"
 	var denyID string
 	// #nosec G201 — schema is library-configured, not user input
 	err := pool.QueryRow(ctx, fmt.Sprintf(`
