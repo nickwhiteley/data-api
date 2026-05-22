@@ -13,23 +13,24 @@ import (
 
 // ExtractWindowInput holds parameters for a window extraction query.
 type ExtractWindowInput struct {
+	Schema     string // PostgreSQL schema name, e.g. "wd" or "core"
 	TenantID   string
-	TableName  string // base table name, e.g. "account"; query hits wd.account_log
+	TableName  string // base table name, e.g. "account"; query hits {schema}.account_log
 	RowCount   int
 	PageNumber int
 	StartAt    time.Time
 	EndAt      time.Time
 }
 
-// ValidateTable returns ErrNotFound if the _log table does not exist in the wd schema.
+// ValidateTable returns ErrNotFound if the _log table does not exist in the given schema.
 // This prevents injection and gives a clean 404 for non-existent tables.
-func ValidateTable(ctx context.Context, pool *pgxpool.Pool, tableName string) error {
+func ValidateTable(ctx context.Context, pool *pgxpool.Pool, schema, tableName string) error {
 	var exists bool
 	err := pool.QueryRow(ctx,
 		`SELECT EXISTS(
             SELECT 1 FROM information_schema.tables
-            WHERE table_schema = 'wd' AND table_name = $1
-        )`, tableName+"_log",
+            WHERE table_schema = $1 AND table_name = $2
+        )`, schema, tableName+"_log",
 	).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("validate table %s: %w", tableName, err)
@@ -40,12 +41,12 @@ func ValidateTable(ctx context.Context, pool *pgxpool.Pool, tableName string) er
 	return nil
 }
 
-// ValidateBaseTable returns ErrNotFound if wd.{tableName} does not exist.
-func ValidateBaseTable(ctx context.Context, pool *pgxpool.Pool, tableName string) error {
+// ValidateBaseTable returns ErrNotFound if {schema}.{tableName} does not exist.
+func ValidateBaseTable(ctx context.Context, pool *pgxpool.Pool, schema, tableName string) error {
 	var exists bool
 	err := pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'wd' AND table_name = $1)`,
-		tableName,
+		`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)`,
+		schema, tableName,
 	).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("validate base table %s: %w", tableName, err)
@@ -58,18 +59,19 @@ func ValidateBaseTable(ctx context.Context, pool *pgxpool.Pool, tableName string
 
 // ExtractCurrentInput holds parameters for a current-state extraction query.
 type ExtractCurrentInput struct {
+	Schema     string // PostgreSQL schema name
 	TenantID   string
 	TableName  string // base table name, e.g. "account"
 	RowCount   int
 	PageNumber int
 }
 
-// ExtractCurrent runs a paginated query against wd.{tableName} (base table, not log).
+// ExtractCurrent runs a paginated query against {schema}.{tableName} (base table, not log).
 // Returns non-deleted rows ordered by primary key for consistent pagination.
 func ExtractCurrent(ctx context.Context, pool *pgxpool.Pool, input ExtractCurrentInput) (pgx.Rows, error) {
-	table := "wd." + input.TableName
+	table := input.Schema + "." + input.TableName
 	offset := (input.PageNumber - 1) * input.RowCount
-	// #nosec G201 — tableName validated against information_schema before this call.
+	// #nosec G201 — tableName validated against information_schema before this call; schema is library-configured.
 	query := fmt.Sprintf(
 		`SELECT * FROM %s WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY %s_id ASC LIMIT $2 OFFSET $3`,
 		table, input.TableName,
@@ -87,35 +89,34 @@ type TableInfo struct {
 	Description string `json:"description"`
 }
 
-// DiscoverTables returns all wd schema _log tables that have a corresponding base table
+// DiscoverTables returns all {schema} _log tables that have a corresponding base table
 // with a tenant_id column, excluding denied tables and data_extraction_execution_log.
-// The tenant_id requirement excludes platform-wide tables (e.g. platform_config,
-// data_extraction_deny) that cannot be safely filtered per-tenant.
-func DiscoverTables(ctx context.Context, pool *pgxpool.Pool) ([]TableInfo, error) {
+// The tenant_id requirement excludes platform-wide tables that cannot be safely filtered per-tenant.
+func DiscoverTables(ctx context.Context, pool *pgxpool.Pool, schema string) ([]TableInfo, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT
 		    t.table_name,
 		    COALESCE(obj_description(pc.oid, 'pg_class'), '') AS description
 		FROM information_schema.tables t
 		JOIN information_schema.tables base
-		    ON base.table_schema = 'wd'
+		    ON base.table_schema = $1
 		   AND base.table_name = regexp_replace(t.table_name, '_log$', '')
 		JOIN information_schema.columns tc
-		    ON tc.table_schema = 'wd'
+		    ON tc.table_schema = $1
 		   AND tc.table_name = regexp_replace(t.table_name, '_log$', '')
 		   AND tc.column_name = 'tenant_id'
 		LEFT JOIN pg_catalog.pg_class pc
 		    ON pc.relname = t.table_name
-		   AND pc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'wd')
-		WHERE t.table_schema = 'wd'
+		   AND pc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+		WHERE t.table_schema = $1
 		  AND t.table_name LIKE '%_log'
 		  AND t.table_name != 'data_extraction_execution_log'
 		  AND NOT EXISTS (
-		      SELECT 1 FROM wd.data_extraction_deny d
+		      SELECT 1 FROM ` + schema + `.data_extraction_deny d
 		      WHERE d.table_name = regexp_replace(t.table_name, '_log$', '')
 		        AND d.deleted_at IS NULL
 		  )
-		ORDER BY t.table_name ASC`,
+		ORDER BY t.table_name ASC`, schema,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("discover tables: %w", err)
@@ -135,14 +136,14 @@ func DiscoverTables(ctx context.Context, pool *pgxpool.Pool) ([]TableInfo, error
 	return tables, rows.Err()
 }
 
-// ExtractWindow runs a paginated window query against wd.{tableName}_log.
+// ExtractWindow runs a paginated window query against {schema}.{tableName}_log.
 // Returns pgx.Rows so the handler can stream-serialise via Serialise().
 // Caller must close rows.
 func ExtractWindow(ctx context.Context, pool *pgxpool.Pool, input ExtractWindowInput) (pgx.Rows, error) {
-	table := "wd." + input.TableName + "_log"
+	table := input.Schema + "." + input.TableName + "_log"
 	offset := (input.PageNumber - 1) * input.RowCount
 
-	// #nosec G201 — tableName validated against information_schema before this call.
+	// #nosec G201 — tableName validated against information_schema before this call; schema is library-configured.
 	query := fmt.Sprintf(
 		`SELECT * FROM %s
          WHERE tenant_id = $1

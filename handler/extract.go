@@ -17,18 +17,38 @@ import (
 	"github.com/nickwhiteley/data-api/pkg/respond"
 )
 
+// Config holds library-level configuration for the handler.
+type Config struct {
+	// Schema is the PostgreSQL schema name for all extraction queries.
+	// Defaults to "wd" if empty.
+	Schema string
+	// RequiredScope is the API key scope checked on every extraction request.
+	// Defaults to "data_engineer" if empty.
+	RequiredScope string
+}
+
 // ExtractHandler handles data extraction HTTP requests.
 type ExtractHandler struct {
-	pool *pgxpool.Pool
-	auth AuthContext
-	cfg  DataConfig
+	pool          *pgxpool.Pool
+	auth          AuthContext
+	cfg           DataConfig
+	schema        string
+	requiredScope string
 }
 
 // NewHandler creates a data extraction handler.
 // auth extracts scope/userID/tenantID from the request context using the host application's middleware.
 // cfg supplies runtime config values; implementations should read from a live source.
-func NewHandler(pool *pgxpool.Pool, auth AuthContext, cfg DataConfig) *ExtractHandler {
-	return &ExtractHandler{pool: pool, auth: auth, cfg: cfg}
+func NewHandler(pool *pgxpool.Pool, auth AuthContext, cfg DataConfig, config Config) *ExtractHandler {
+	schema := config.Schema
+	if schema == "" {
+		schema = "wd"
+	}
+	requiredScope := config.RequiredScope
+	if requiredScope == "" {
+		requiredScope = "data_engineer"
+	}
+	return &ExtractHandler{pool: pool, auth: auth, cfg: cfg, schema: schema, requiredScope: requiredScope}
 }
 
 // RegisterRoutes mounts all data extraction routes on r.
@@ -41,8 +61,8 @@ func (h *ExtractHandler) RegisterRoutes(r chi.Router) {
 }
 
 // WindowExtract handles GET /v1/data/extract/{table}.
-// A data engineer (authenticated via API key with scope data_engineer) extracts
-// incremental changes from wd.{table}_log using a moving cursor.
+// A data engineer (authenticated via API key with the required scope) extracts
+// incremental changes from {schema}.{table}_log using a moving cursor.
 func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tableName := chi.URLParam(r, "table")
@@ -50,25 +70,13 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 	userID := h.auth.UserID(ctx)
 
 	// Step 1: scope check.
-	if h.auth.Scope(ctx) != "data_engineer" {
-		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "data_engineer scope required"))
+	if h.auth.Scope(ctx) != h.requiredScope {
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, h.requiredScope+" scope required"))
 		return
 	}
 
-	// Step 2: tier check.
-	enabled, err := dataextract.IsDataAPIEnabled(ctx, h.pool, tenantID)
-	if err != nil {
-		errlog.Log(ctx, "check data api tier", err)
-		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
-		return
-	}
-	if !enabled {
-		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "data API is not available on your current plan"))
-		return
-	}
-
-	// Step 3: deny check.
-	denied, err := dataextract.IsDenied(ctx, h.pool, tableName)
+	// Step 2: deny check.
+	denied, err := dataextract.IsDenied(ctx, h.pool, h.schema, tableName)
 	if err != nil {
 		errlog.Log(ctx, "check deny list", err)
 		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
@@ -79,8 +87,8 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 4: table existence.
-	if err := dataextract.ValidateTable(ctx, h.pool, tableName); err != nil {
+	// Step 3: table existence.
+	if err := dataextract.ValidateTable(ctx, h.pool, h.schema, tableName); err != nil {
 		if errors.Is(err, dataextract.ErrNotFound) {
 			respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
 			return
@@ -90,7 +98,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 5: parse row_count (optional, default 1000).
+	// Step 4: parse row_count (optional, default 1000).
 	rowCount := 1000
 	if rowCountStr := r.URL.Query().Get("row_count"); rowCountStr != "" {
 		var parseErr error
@@ -105,7 +113,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 6: parse page_number (optional, default 1).
+	// Step 5: parse page_number (optional, default 1).
 	pageNumber := 1
 	if pStr := r.URL.Query().Get("page_number"); pStr != "" {
 		var parseErr error
@@ -116,7 +124,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 7: determine execution context.
+	// Step 6: determine execution context.
 	var execID string
 	var startAt, endAt time.Time
 
@@ -131,7 +139,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			var cursorErr error
-			startAt, cursorErr = dataextract.CursorFor(ctx, h.pool, userID, tableName)
+			startAt, cursorErr = dataextract.CursorFor(ctx, h.pool, h.schema, userID, tableName)
 			if cursorErr != nil {
 				errlog.Log(ctx, "get cursor", cursorErr)
 				respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
@@ -154,6 +162,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 
 		var insertErr error
 		execID, insertErr = dataextract.InsertOrReusePending(ctx, h.pool, dataextract.InsertPendingInput{
+			Schema:      h.schema,
 			TenantID:    tenantID,
 			UserID:      userID,
 			TableName:   tableName,
@@ -173,7 +182,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 			respond.JSON(w, http.StatusBadRequest, apierror.New(apierror.CodeValidationError, "data_extraction_execution_id is required for page 2+"))
 			return
 		}
-		exec, execErr := dataextract.GetExecutionByID(ctx, h.pool, execIDParam, userID)
+		exec, execErr := dataextract.GetExecutionByID(ctx, h.pool, h.schema, execIDParam, userID)
 		if execErr != nil {
 			if errors.Is(execErr, dataextract.ErrNotFound) {
 				respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "execution not found"))
@@ -188,8 +197,9 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		endAt = exec.EndAt
 	}
 
-	// Step 8: run extraction.
+	// Step 7: run extraction.
 	rows, err := dataextract.ExtractWindow(ctx, h.pool, dataextract.ExtractWindowInput{
+		Schema:     h.schema,
 		TenantID:   tenantID,
 		TableName:  tableName,
 		RowCount:   rowCount,
@@ -203,7 +213,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 9: serialise.
+	// Step 8: serialise.
 	result, err := dataextract.Serialise(rows, execID)
 	if err != nil {
 		errlog.Log(ctx, "serialise extraction rows", err)
@@ -211,14 +221,15 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 10: status transitions.
+	// Step 9: status transitions.
 	if pageNumber == 1 {
-		if err := dataextract.TransitionStarted(ctx, h.pool, execID); err != nil && !errors.Is(err, dataextract.ErrNotFound) {
+		if err := dataextract.TransitionStarted(ctx, h.pool, h.schema, execID); err != nil && !errors.Is(err, dataextract.ErrNotFound) {
 			errlog.Log(ctx, "transition execution to started", err)
 		}
 	}
 	if len(result.Rows) < rowCount {
 		if err := dataextract.TransitionCompleted(ctx, h.pool, dataextract.TransitionCompletedInput{
+			Schema:    h.schema,
 			ExecID:    execID,
 			RowCount:  len(result.Rows),
 			TimeTaken: 0,
@@ -238,25 +249,13 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 	userID := h.auth.UserID(ctx)
 
 	// Step 1: scope check.
-	if h.auth.Scope(ctx) != "data_engineer" {
-		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "data_engineer scope required"))
+	if h.auth.Scope(ctx) != h.requiredScope {
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, h.requiredScope+" scope required"))
 		return
 	}
 
-	// Step 2: tier check.
-	enabled, err := dataextract.IsDataAPIEnabled(ctx, h.pool, tenantID)
-	if err != nil {
-		errlog.Log(ctx, "check data api tier", err)
-		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
-		return
-	}
-	if !enabled {
-		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "data API is not available on your current plan"))
-		return
-	}
-
-	// Step 3: deny check.
-	denied, err := dataextract.IsDenied(ctx, h.pool, tableName)
+	// Step 2: deny check.
+	denied, err := dataextract.IsDenied(ctx, h.pool, h.schema, tableName)
 	if err != nil {
 		errlog.Log(ctx, "check deny list", err)
 		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
@@ -267,8 +266,8 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Step 4: base table existence.
-	if err := dataextract.ValidateBaseTable(ctx, h.pool, tableName); err != nil {
+	// Step 3: base table existence.
+	if err := dataextract.ValidateBaseTable(ctx, h.pool, h.schema, tableName); err != nil {
 		if errors.Is(err, dataextract.ErrNotFound) {
 			respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
 			return
@@ -278,7 +277,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Step 5: parse row_count (optional, default 1000).
+	// Step 4: parse row_count (optional, default 1000).
 	rowCount := 1000
 	if rowCountStr := r.URL.Query().Get("row_count"); rowCountStr != "" {
 		var parseErr error
@@ -293,7 +292,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Step 6: parse page_number.
+	// Step 5: parse page_number.
 	pageNumber := 1
 	if pStr := r.URL.Query().Get("page_number"); pStr != "" {
 		var parseErr error
@@ -308,8 +307,8 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 	now := time.Now().UTC()
 
 	if pageNumber == 1 {
-		// Step 7: daily limit check (only on page 1).
-		count, countErr := dataextract.CurrentExtractionCount(ctx, h.pool, userID, tableName)
+		// Step 6: daily limit check (only on page 1).
+		count, countErr := dataextract.CurrentExtractionCount(ctx, h.pool, h.schema, userID, tableName)
 		if countErr != nil {
 			errlog.Log(ctx, "check daily extraction count", countErr)
 			respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
@@ -322,6 +321,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 
 		var insertErr error
 		execID, insertErr = dataextract.InsertOrReusePending(ctx, h.pool, dataextract.InsertPendingInput{
+			Schema:      h.schema,
 			TenantID:    tenantID,
 			UserID:      userID,
 			TableName:   tableName,
@@ -340,7 +340,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 			respond.JSON(w, http.StatusBadRequest, apierror.New(apierror.CodeValidationError, "data_extraction_execution_id is required for page 2+"))
 			return
 		}
-		exec, execErr := dataextract.GetExecutionByID(ctx, h.pool, execIDParam, userID)
+		exec, execErr := dataextract.GetExecutionByID(ctx, h.pool, h.schema, execIDParam, userID)
 		if execErr != nil {
 			if errors.Is(execErr, dataextract.ErrNotFound) {
 				respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "execution not found"))
@@ -354,6 +354,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 	}
 
 	rows, err := dataextract.ExtractCurrent(ctx, h.pool, dataextract.ExtractCurrentInput{
+		Schema:     h.schema,
 		TenantID:   tenantID,
 		TableName:  tableName,
 		RowCount:   rowCount,
@@ -373,12 +374,13 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if pageNumber == 1 {
-		if err := dataextract.TransitionStarted(ctx, h.pool, execID); err != nil && !errors.Is(err, dataextract.ErrNotFound) {
+		if err := dataextract.TransitionStarted(ctx, h.pool, h.schema, execID); err != nil && !errors.Is(err, dataextract.ErrNotFound) {
 			errlog.Log(ctx, "transition current execution to started", err)
 		}
 	}
 	if len(result.Rows) < rowCount {
 		if err := dataextract.TransitionCompleted(ctx, h.pool, dataextract.TransitionCompletedInput{
+			Schema:    h.schema,
 			ExecID:    execID,
 			RowCount:  len(result.Rows),
 			TimeTaken: 0,
@@ -391,21 +393,22 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 }
 
 // DiscoverTables handles GET /v1/data/extract.
-// Accessible to data engineers (API key scope) as well as tenant_admin and platform_admin (session auth).
+// Accessible to the required scope (API key) as well as tenant_admin and platform_admin (session auth).
 func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
 
 	scope := h.auth.Scope(ctx)
-	if scope != "data_engineer" {
+	if scope != h.requiredScope {
 		// Session-based auth — check role in DB.
 		var role string
+		// #nosec G201 — schema is library-configured, not user input
 		err := h.pool.QueryRow(ctx,
-			`SELECT role FROM wd.user_org
+			fmt.Sprintf(`SELECT role FROM %s.user_org
 			 WHERE user_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 			   AND role IN ('data_engineer', 'tenant_admin', 'platform_admin')
-			 LIMIT 1`,
+			 LIMIT 1`, h.schema),
 			userID, tenantID,
 		).Scan(&role)
 		if err != nil {
@@ -414,7 +417,7 @@ func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	tables, err := dataextract.DiscoverTables(ctx, h.pool)
+	tables, err := dataextract.DiscoverTables(ctx, h.pool, h.schema)
 	if err != nil {
 		errlog.Log(ctx, "discover tables", err)
 		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
@@ -430,23 +433,12 @@ func (h *ExtractHandler) ResetExtraction(w http.ResponseWriter, r *http.Request)
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
 
-	if h.auth.Scope(ctx) != "data_engineer" {
-		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "data_engineer scope required"))
+	if h.auth.Scope(ctx) != h.requiredScope {
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, h.requiredScope+" scope required"))
 		return
 	}
 
-	enabled, err := dataextract.IsDataAPIEnabled(ctx, h.pool, tenantID)
-	if err != nil {
-		errlog.Log(ctx, "check data api tier for reset", err)
-		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
-		return
-	}
-	if !enabled {
-		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "data API is not available on your current plan"))
-		return
-	}
-
-	denied, err := dataextract.IsDenied(ctx, h.pool, tableName)
+	denied, err := dataextract.IsDenied(ctx, h.pool, h.schema, tableName)
 	if err != nil {
 		errlog.Log(ctx, "check deny list for reset", err)
 		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
@@ -457,7 +449,7 @@ func (h *ExtractHandler) ResetExtraction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := dataextract.ValidateTable(ctx, h.pool, tableName); err != nil {
+	if err := dataextract.ValidateTable(ctx, h.pool, h.schema, tableName); err != nil {
 		if errors.Is(err, dataextract.ErrNotFound) {
 			respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
 			return
@@ -479,6 +471,7 @@ func (h *ExtractHandler) ResetExtraction(w http.ResponseWriter, r *http.Request)
 	}
 
 	execID, err := dataextract.InsertReset(ctx, h.pool, dataextract.InsertResetInput{
+		Schema:    h.schema,
 		TenantID:  tenantID,
 		UserID:    userID,
 		TableName: tableName,
@@ -508,10 +501,11 @@ func (h *ExtractHandler) ListExecutions(w http.ResponseWriter, r *http.Request) 
 	var role string
 	if scope == "" {
 		// Session auth — look up role from DB.
+		// #nosec G201 — schema is library-configured, not user input
 		_ = h.pool.QueryRow(ctx,
-			`SELECT role FROM wd.user_org
+			fmt.Sprintf(`SELECT role FROM %s.user_org
 			 WHERE user_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-			 LIMIT 1`,
+			 LIMIT 1`, h.schema),
 			userID, tenantID,
 		).Scan(&role)
 	} else {
@@ -519,9 +513,10 @@ func (h *ExtractHandler) ListExecutions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	input := dataextract.ListExecutionsInput{
+		Schema:  h.schema,
 		TenantID: tenantID,
-		Page:     1,
-		PerPage:  20,
+		Page:    1,
+		PerPage: 20,
 	}
 
 	switch role {

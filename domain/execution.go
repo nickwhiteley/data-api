@@ -8,7 +8,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
 )
 
 // ErrNotFound is returned when a requested record does not exist.
@@ -16,6 +15,7 @@ var ErrNotFound = errors.New("not found")
 
 // InsertPendingInput holds params for inserting a pending execution row.
 type InsertPendingInput struct {
+	Schema      string // PostgreSQL schema name
 	TenantID    string
 	UserID      string
 	TableName   string
@@ -28,10 +28,10 @@ type InsertPendingInput struct {
 // Uses an advisory lock to ensure idempotency under concurrent page-1 retries.
 // Returns execution ID (never empty on nil error).
 func InsertOrReusePending(ctx context.Context, pool *pgxpool.Pool, input InsertPendingInput) (string, error) {
-	// Hash the lock key from user_id + table_name.
+	execTable := input.Schema + ".data_extraction_execution"
+
 	lockKey := fmt.Sprintf("%s:%s", input.UserID, input.TableName)
 
-	// Use a transaction so pg_advisory_xact_lock is scoped correctly.
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("begin insert pending tx: %w", err)
@@ -48,11 +48,12 @@ func InsertOrReusePending(ctx context.Context, pool *pgxpool.Pool, input InsertP
 
 	// 1. Try to find an existing pending row first (idempotent retry).
 	var execID string
-	err = tx.QueryRow(ctx, `
+	// #nosec G201 — schema is library-configured, not user input
+	err = tx.QueryRow(ctx, fmt.Sprintf(`
 		SELECT data_extraction_execution_id
-		FROM wd.data_extraction_execution
+		FROM %s
 		WHERE user_id = $1 AND table_name = $2 AND status = 'pending'
-		LIMIT 1`,
+		LIMIT 1`, execTable),
 		input.UserID, input.TableName,
 	).Scan(&execID)
 	if err == nil {
@@ -66,11 +67,12 @@ func InsertOrReusePending(ctx context.Context, pool *pgxpool.Pool, input InsertP
 	}
 
 	// 2. No pending row — insert a new one.
-	if err := tx.QueryRow(ctx, `
-		INSERT INTO wd.data_extraction_execution
+	// #nosec G201 — schema is library-configured, not user input
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`
+		INSERT INTO %s
 			(tenant_id, user_id, table_name, extract_type, status, start_at, end_at)
 		VALUES ($1, $2, $3, $4, 'pending', $5, $6)
-		RETURNING data_extraction_execution_id`,
+		RETURNING data_extraction_execution_id`, execTable),
 		input.TenantID, input.UserID, input.TableName, input.ExtractType,
 		input.StartAt, input.EndAt,
 	).Scan(&execID); err != nil {
@@ -84,11 +86,13 @@ func InsertOrReusePending(ctx context.Context, pool *pgxpool.Pool, input InsertP
 }
 
 // TransitionStarted moves a pending execution to started.
-func TransitionStarted(ctx context.Context, pool *pgxpool.Pool, execID string) error {
-	tag, err := pool.Exec(ctx, `
-		UPDATE wd.data_extraction_execution
+func TransitionStarted(ctx context.Context, pool *pgxpool.Pool, schema, execID string) error {
+	execTable := schema + ".data_extraction_execution"
+	// #nosec G201 — schema is library-configured, not user input
+	tag, err := pool.Exec(ctx, fmt.Sprintf(`
+		UPDATE %s
 		SET status = 'started', updated_at = clock_timestamp()
-		WHERE data_extraction_execution_id = $1 AND status = 'pending'`,
+		WHERE data_extraction_execution_id = $1 AND status = 'pending'`, execTable),
 		execID,
 	)
 	if err != nil {
@@ -103,6 +107,7 @@ func TransitionStarted(ctx context.Context, pool *pgxpool.Pool, execID string) e
 
 // TransitionCompletedInput holds params for completing an execution.
 type TransitionCompletedInput struct {
+	Schema    string // PostgreSQL schema name
 	ExecID    string
 	RowCount  int
 	TimeTaken int // milliseconds
@@ -110,13 +115,15 @@ type TransitionCompletedInput struct {
 
 // TransitionCompleted moves a started/pending execution to completed.
 func TransitionCompleted(ctx context.Context, pool *pgxpool.Pool, input TransitionCompletedInput) error {
-	tag, err := pool.Exec(ctx, `
-		UPDATE wd.data_extraction_execution
+	execTable := input.Schema + ".data_extraction_execution"
+	// #nosec G201 — schema is library-configured, not user input
+	tag, err := pool.Exec(ctx, fmt.Sprintf(`
+		UPDATE %s
 		SET status = 'completed',
 		    row_count = $2,
 		    execution_time_taken = $3,
 		    updated_at = clock_timestamp()
-		WHERE data_extraction_execution_id = $1 AND status IN ('started', 'pending')`,
+		WHERE data_extraction_execution_id = $1 AND status IN ('started', 'pending')`, execTable),
 		input.ExecID, input.RowCount, input.TimeTaken,
 	)
 	if err != nil {
@@ -131,6 +138,7 @@ func TransitionCompleted(ctx context.Context, pool *pgxpool.Pool, input Transiti
 
 // InsertResetInput holds params for inserting a reset row.
 type InsertResetInput struct {
+	Schema    string // PostgreSQL schema name
 	TenantID  string
 	UserID    string
 	TableName string
@@ -139,12 +147,14 @@ type InsertResetInput struct {
 
 // InsertReset inserts a reset cursor row. Returns the new execution ID.
 func InsertReset(ctx context.Context, pool *pgxpool.Pool, input InsertResetInput) (string, error) {
+	execTable := input.Schema + ".data_extraction_execution"
 	var execID string
-	if err := pool.QueryRow(ctx, `
-		INSERT INTO wd.data_extraction_execution
+	// #nosec G201 — schema is library-configured, not user input
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`
+		INSERT INTO %s
 			(tenant_id, user_id, table_name, extract_type, status, start_at, end_at)
 		VALUES ($1, $2, $3, 'window', 'reset', clock_timestamp(), $4)
-		RETURNING data_extraction_execution_id`,
+		RETURNING data_extraction_execution_id`, execTable),
 		input.TenantID, input.UserID, input.TableName, input.EndAt,
 	).Scan(&execID); err != nil {
 		return "", fmt.Errorf("insert reset execution: %w", err)
@@ -155,16 +165,18 @@ func InsertReset(ctx context.Context, pool *pgxpool.Pool, input InsertResetInput
 
 // CursorFor returns the most recent end_at for the user+table (completed or reset rows).
 // Returns 2000-01-01 00:00:00 UTC if no row found.
-func CursorFor(ctx context.Context, pool *pgxpool.Pool, userID, tableName string) (time.Time, error) {
+func CursorFor(ctx context.Context, pool *pgxpool.Pool, schema, userID, tableName string) (time.Time, error) {
+	execTable := schema + ".data_extraction_execution"
 	var endAt time.Time
-	err := pool.QueryRow(ctx, `
+	// #nosec G201 — schema is library-configured, not user input
+	err := pool.QueryRow(ctx, fmt.Sprintf(`
 		SELECT end_at
-		FROM wd.data_extraction_execution
+		FROM %s
 		WHERE user_id = $1 AND table_name = $2
 		  AND status IN ('completed', 'reset')
 		  AND deleted_at IS NULL
 		ORDER BY inserted_at DESC
-		LIMIT 1`,
+		LIMIT 1`, execTable),
 		userID, tableName,
 	).Scan(&endAt)
 	if err != nil {
@@ -177,16 +189,18 @@ func CursorFor(ctx context.Context, pool *pgxpool.Pool, userID, tableName string
 }
 
 // CurrentExtractionCount counts started+completed current extractions today for user+table.
-func CurrentExtractionCount(ctx context.Context, pool *pgxpool.Pool, userID, tableName string) (int, error) {
+func CurrentExtractionCount(ctx context.Context, pool *pgxpool.Pool, schema, userID, tableName string) (int, error) {
+	execTable := schema + ".data_extraction_execution"
 	var count int
-	if err := pool.QueryRow(ctx, `
+	// #nosec G201 — schema is library-configured, not user input
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`
 		SELECT COUNT(*)
-		FROM wd.data_extraction_execution
+		FROM %s
 		WHERE user_id = $1 AND table_name = $2
 		  AND extract_type = 'current'
 		  AND status IN ('started', 'completed')
 		  AND start_at::date = CURRENT_DATE
-		  AND deleted_at IS NULL`,
+		  AND deleted_at IS NULL`, execTable),
 		userID, tableName,
 	).Scan(&count); err != nil {
 		return 0, fmt.Errorf("current extraction count: %w", err)
@@ -210,13 +224,15 @@ type Execution struct {
 
 // GetExecutionByID returns the execution record for the given ID scoped to the user.
 // Returns ErrNotFound if not found or the row belongs to a different user.
-func GetExecutionByID(ctx context.Context, pool *pgxpool.Pool, execID, userID string) (Execution, error) {
+func GetExecutionByID(ctx context.Context, pool *pgxpool.Pool, schema, execID, userID string) (Execution, error) {
+	execTable := schema + ".data_extraction_execution"
 	var e Execution
-	err := pool.QueryRow(ctx, `
+	// #nosec G201 — schema is library-configured, not user input
+	err := pool.QueryRow(ctx, fmt.Sprintf(`
 		SELECT data_extraction_execution_id, tenant_id, user_id, table_name,
 		       extract_type, status, start_at, end_at, row_count, execution_time_taken
-		FROM wd.data_extraction_execution
-		WHERE data_extraction_execution_id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+		FROM %s
+		WHERE data_extraction_execution_id = $1 AND user_id = $2 AND deleted_at IS NULL`, execTable),
 		execID, userID,
 	).Scan(
 		&e.ExecutionID, &e.TenantID, &e.UserID, &e.TableName,
@@ -233,21 +249,22 @@ func GetExecutionByID(ctx context.Context, pool *pgxpool.Pool, execID, userID st
 
 // ExecutionRecord is a flat DTO for the executions list endpoint.
 type ExecutionRecord struct {
-	ExecutionID       string    `json:"data_extraction_execution_id"`
-	TenantID          string    `json:"tenant_id"`
-	UserID            string    `json:"user_id"`
-	TableName         string    `json:"table_name"`
-	ExtractType       string    `json:"extract_type"`
-	Status            string    `json:"status"`
-	StartAt           time.Time `json:"start_at"`
-	EndAt             time.Time `json:"end_at"`
-	RowCount          int       `json:"row_count"`
-	ExecutionTimeTaken int      `json:"execution_time_taken"`
-	InsertedAt        time.Time `json:"inserted_at"`
+	ExecutionID        string    `json:"data_extraction_execution_id"`
+	TenantID           string    `json:"tenant_id"`
+	UserID             string    `json:"user_id"`
+	TableName          string    `json:"table_name"`
+	ExtractType        string    `json:"extract_type"`
+	Status             string    `json:"status"`
+	StartAt            time.Time `json:"start_at"`
+	EndAt              time.Time `json:"end_at"`
+	RowCount           int       `json:"row_count"`
+	ExecutionTimeTaken int       `json:"execution_time_taken"`
+	InsertedAt         time.Time `json:"inserted_at"`
 }
 
 // ListExecutionsInput holds filter and pagination params.
 type ListExecutionsInput struct {
+	Schema    string // PostgreSQL schema name
 	TenantID  string
 	UserID    string    // optional filter
 	StartDate time.Time // optional filter
@@ -257,9 +274,7 @@ type ListExecutionsInput struct {
 }
 
 // ListExecutions returns paginated execution records for the given tenant,
-// optionally filtered by user and date range. Reset rows are included
-// so the cursor history is complete, but callers may choose to hide them
-// in UI presentations.
+// optionally filtered by user and date range.
 func ListExecutions(ctx context.Context, pool *pgxpool.Pool, input ListExecutionsInput) ([]ExecutionRecord, int, error) {
 	if input.Page < 1 {
 		input.Page = 1
@@ -271,7 +286,8 @@ func ListExecutions(ctx context.Context, pool *pgxpool.Pool, input ListExecution
 		input.PerPage = 100
 	}
 
-	// Build WHERE clause dynamically.
+	execTable := input.Schema + ".data_extraction_execution"
+
 	args := []any{input.TenantID}
 	where := "WHERE tenant_id = $1 AND deleted_at IS NULL"
 	argIdx := 1
@@ -292,29 +308,29 @@ func ListExecutions(ctx context.Context, pool *pgxpool.Pool, input ListExecution
 		where += fmt.Sprintf(" AND end_at <= $%d", argIdx)
 	}
 
-	// Count total.
+	// #nosec G201 — schema is library-configured, not user input
 	var total int
-	countQuery := "SELECT COUNT(*) FROM wd.data_extraction_execution " + where
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s %s", execTable, where)
 	if err := pool.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count executions: %w", err)
 	}
 
-	// Fetch page.
 	argIdx++
 	limitArg := argIdx
 	argIdx++
 	offsetArg := argIdx
 	args = append(args, input.PerPage, (input.Page-1)*input.PerPage)
 
+	// #nosec G201 — schema is library-configured, not user input
 	query := fmt.Sprintf(
 		`SELECT data_extraction_execution_id, tenant_id, user_id, table_name,
 		        extract_type, status, start_at, end_at, row_count, execution_time_taken,
 		        inserted_at
-		 FROM wd.data_extraction_execution
+		 FROM %s
 		 %s
 		 ORDER BY inserted_at DESC
 		 LIMIT $%d OFFSET $%d`,
-		where, limitArg, offsetArg,
+		execTable, where, limitArg, offsetArg,
 	)
 
 	rows, err := pool.Query(ctx, query, args...)
