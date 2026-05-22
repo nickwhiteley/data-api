@@ -64,17 +64,19 @@ type DenyEntry struct {
 
 // IsDenied checks if a table is on the active deny list or the hard-blocked list.
 // tableName may include the _log suffix — it is normalised to the base name before the check.
-func IsDenied(ctx context.Context, pool *pgxpool.Pool, tableName string) (bool, error) {
+func IsDenied(ctx context.Context, pool *pgxpool.Pool, schema, tableName string) (bool, error) {
 	base := normalizeTableName(tableName)
 	if IsHardBlocked(base) {
 		return true, nil
 	}
+	denyTable := schema + "data_extraction_deny"
 	var exists bool
-	if err := pool.QueryRow(ctx, `
+	// #nosec G201 — schema is library-configured, not user input
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`
 		SELECT EXISTS(
-			SELECT 1 FROM wd.data_extraction_deny
+			SELECT 1 FROM %s
 			WHERE table_name = $1 AND deleted_at IS NULL
-		)`, base,
+		)`, denyTable), base,
 	).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check deny list: %w", err)
 	}
@@ -82,12 +84,14 @@ func IsDenied(ctx context.Context, pool *pgxpool.Pool, tableName string) (bool, 
 }
 
 // ListDenied returns all active deny entries.
-func ListDenied(ctx context.Context, pool *pgxpool.Pool) ([]DenyEntry, error) {
-	rows, err := pool.Query(ctx, `
+func ListDenied(ctx context.Context, pool *pgxpool.Pool, schema string) ([]DenyEntry, error) {
+	denyTable := schema + "data_extraction_deny"
+	// #nosec G201 — schema is library-configured, not user input
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
 		SELECT data_extraction_deny_id, table_name, inserted_by, inserted_at
-		FROM wd.data_extraction_deny
+		FROM %s
 		WHERE deleted_at IS NULL
-		ORDER BY table_name ASC`,
+		ORDER BY table_name ASC`, denyTable),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list denied tables: %w", err)
@@ -110,21 +114,23 @@ func ListDenied(ctx context.Context, pool *pgxpool.Pool) ([]DenyEntry, error) {
 
 // AddDenyInput holds params for adding a deny entry.
 type AddDenyInput struct {
+	Schema     string // PostgreSQL schema name
 	TableName  string
 	InsertedBy string // user_id of the platform admin
 }
 
 // AddDeny adds a table to the deny list. Returns ErrDenyConflict if already active.
 func AddDeny(ctx context.Context, pool *pgxpool.Pool, input AddDenyInput) (DenyEntry, error) {
+	denyTable := input.Schema + "data_extraction_deny"
 	var e DenyEntry
-	err := pool.QueryRow(ctx, `
-		INSERT INTO wd.data_extraction_deny (table_name, inserted_by)
+	// #nosec G201 — schema is library-configured, not user input
+	err := pool.QueryRow(ctx, fmt.Sprintf(`
+		INSERT INTO %s (table_name, inserted_by)
 		VALUES ($1, $2)
-		RETURNING data_extraction_deny_id, table_name, inserted_by, inserted_at`,
+		RETURNING data_extraction_deny_id, table_name, inserted_by, inserted_at`, denyTable),
 		input.TableName, input.InsertedBy,
 	).Scan(&e.DenyID, &e.TableName, &e.InsertedBy, &e.InsertedAt)
 	if err != nil {
-		// Unique index violation — table already on active deny list.
 		if isUniqueViolation(err) {
 			return DenyEntry{}, ErrDenyConflict
 		}
@@ -135,13 +141,15 @@ func AddDeny(ctx context.Context, pool *pgxpool.Pool, input AddDenyInput) (DenyE
 }
 
 // RemoveDeny soft-deletes the deny entry for the given table. Returns ErrNotFound if not active.
-func RemoveDeny(ctx context.Context, pool *pgxpool.Pool, tableName string) error {
+func RemoveDeny(ctx context.Context, pool *pgxpool.Pool, schema, tableName string) error {
+	denyTable := schema + "data_extraction_deny"
 	var denyID string
-	err := pool.QueryRow(ctx, `
-		UPDATE wd.data_extraction_deny
+	// #nosec G201 — schema is library-configured, not user input
+	err := pool.QueryRow(ctx, fmt.Sprintf(`
+		UPDATE %s
 		SET deleted_at = clock_timestamp()
 		WHERE table_name = $1 AND deleted_at IS NULL
-		RETURNING data_extraction_deny_id`,
+		RETURNING data_extraction_deny_id`, denyTable),
 		tableName,
 	).Scan(&denyID)
 	if err != nil {
@@ -156,7 +164,6 @@ func RemoveDeny(ctx context.Context, pool *pgxpool.Pool, tableName string) error
 
 // isUniqueViolation returns true when err is a PostgreSQL unique_violation (code 23505).
 func isUniqueViolation(err error) bool {
-	// pgx wraps the PgError; check the SQLState code.
 	type pgErr interface {
 		SQLState() string
 	}
