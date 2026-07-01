@@ -24,8 +24,11 @@ import (
 
 // DJSONResponse is the columnar extraction response format.
 // Columns lists the field names; Rows contains one slice per row.
+// StartAt and EndAt are populated by window extractions; omitted for current extractions.
 type DJSONResponse struct {
 	ExecutionID string          `json:"data_extraction_execution_id"`
+	StartAt     *time.Time      `json:"start_at,omitempty"`
+	EndAt       *time.Time      `json:"end_at,omitempty"`
 	Columns     []string        `json:"columns"`
 	Rows        [][]interface{} `json:"rows"`
 }

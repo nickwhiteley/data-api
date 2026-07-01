@@ -5,8 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/go-chi/chi/v5"
 )
 
 // stubAuth is a test implementation of AuthContext.
@@ -25,73 +23,56 @@ type stubConfig struct{ lag int }
 
 func (c stubConfig) SafetyLagSeconds() int { return c.lag }
 
+// scopeCheckRequest sends a request to the handler's mux and returns the response code.
+// The path must include any URL path values (e.g. /data/extract/account).
+func scopeCheckRequest(t *testing.T, h *ExtractHandler, method, path string) int {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	rec := httptest.NewRecorder()
+	h.Handler().ServeHTTP(rec, req)
+	return rec.Code
+}
+
 func TestWindowExtract_ScopeCheck(t *testing.T) {
 	t.Parallel()
 	// A request without the required scope must be rejected with 403.
 	h := NewHandler(nil, stubAuth{scope: "other_scope"}, stubConfig{lag: 5}, Config{})
-
-	r := chi.NewRouter()
-	r.Get("/data/extract/{table}", h.WindowExtract)
-
-	req := httptest.NewRequest(http.MethodGet, "/data/extract/account", nil)
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusForbidden {
-		t.Errorf("expected 403 for wrong scope, got %d", rec.Code)
+	if got := scopeCheckRequest(t, h, http.MethodGet, "/data/extract/account"); got != http.StatusForbidden {
+		t.Errorf("expected 403 for wrong scope, got %d", got)
 	}
 }
 
 func TestCurrentExtract_ScopeCheck(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(nil, stubAuth{scope: ""}, stubConfig{lag: 5}, Config{})
-
-	r := chi.NewRouter()
-	r.Get("/data/extract/{table}/current", h.CurrentExtract)
-
-	req := httptest.NewRequest(http.MethodGet, "/data/extract/account/current", nil)
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusForbidden {
-		t.Errorf("expected 403 for missing scope, got %d", rec.Code)
+	if got := scopeCheckRequest(t, h, http.MethodGet, "/data/extract/account/current"); got != http.StatusForbidden {
+		t.Errorf("expected 403 for missing scope, got %d", got)
 	}
 }
 
 func TestResetExtraction_ScopeCheck(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(nil, stubAuth{scope: "tenant_admin"}, stubConfig{lag: 5}, Config{})
-
-	r := chi.NewRouter()
-	r.Post("/data/extract/{table}/reset", h.ResetExtraction)
-
-	req := httptest.NewRequest(http.MethodPost, "/data/extract/account/reset", nil)
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusForbidden {
-		t.Errorf("expected 403 for non-required scope, got %d", rec.Code)
+	if got := scopeCheckRequest(t, h, http.MethodPost, "/data/extract/account/reset"); got != http.StatusForbidden {
+		t.Errorf("expected 403 for non-required scope, got %d", got)
 	}
 }
 
 // TestRequiredScope_ConfigurableScope verifies that RequiredScope is respected rather than
-// the hardcoded "data_engineer" literal. A request with the default scope is rejected when
-// the handler is configured with a different scope.
+// the hardcoded "data_engineer" literal.
 func TestRequiredScope_ConfigurableScope(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name          string
-		configScope   string
-		requestScope  string
-		wantStatus    int
+		name         string
+		configScope  string
+		requestScope string
+		wantStatus   int
 	}{
 		{
 			name:         "custom scope accepted",
 			configScope:  "mop_data_engineer",
 			requestScope: "mop_data_engineer",
-			// Will hit the pool (nil) after scope check passes — that's expected to panic or fail further,
-			// but scope check itself must pass (not return 403 at scope stage).
-			// We test the 403 case instead.
+			// Scope passes but nil pool will fail further — skip.
 		},
 		{
 			name:         "default scope rejected when custom configured",
@@ -112,22 +93,13 @@ func TestRequiredScope_ConfigurableScope(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			if tc.wantStatus == 0 {
-				// Skip cases that would nil-panic beyond scope check.
 				t.Skip("scope passes — further test requires DB")
 			}
 			h := NewHandler(nil, stubAuth{scope: tc.requestScope}, stubConfig{lag: 5}, Config{
 				RequiredScope: tc.configScope,
 			})
-
-			r := chi.NewRouter()
-			r.Get("/data/extract/{table}", h.WindowExtract)
-
-			req := httptest.NewRequest(http.MethodGet, "/data/extract/account", nil)
-			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, req)
-
-			if rec.Code != tc.wantStatus {
-				t.Errorf("scope=%q config=%q: expected %d, got %d", tc.requestScope, tc.configScope, tc.wantStatus, rec.Code)
+			if got := scopeCheckRequest(t, h, http.MethodGet, "/data/extract/account"); got != tc.wantStatus {
+				t.Errorf("scope=%q config=%q: expected %d, got %d", tc.requestScope, tc.configScope, tc.wantStatus, got)
 			}
 		})
 	}
@@ -165,7 +137,6 @@ func TestNewHandler_InterfaceSatisfaction(t *testing.T) {
 func TestNewHandler_DefaultSchema(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(nil, stubAuth{}, stubConfig{}, Config{})
-	// Empty schema = no qualification; host app relies on search_path.
 	if h.schema != "" {
 		t.Errorf("expected empty schema for zero config, got %q", h.schema)
 	}
@@ -177,7 +148,6 @@ func TestNewHandler_DefaultSchema(t *testing.T) {
 func TestNewHandler_ExplicitConfig(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(nil, stubAuth{}, stubConfig{}, Config{Schema: "core", RequiredScope: "mop_data_engineer"})
-	// Schema is stored with trailing dot so table refs are "core.tablename".
 	if h.schema != "core." {
 		t.Errorf("expected schema 'core.', got %q", h.schema)
 	}

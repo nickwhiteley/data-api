@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	dataextract "github.com/nickwhiteley/data-api/domain"
@@ -51,13 +50,16 @@ func NewHandler(pool *pgxpool.Pool, auth AuthContext, cfg DataConfig, config Con
 	return &ExtractHandler{pool: pool, auth: auth, cfg: cfg, schema: schema, requiredScope: requiredScope}
 }
 
-// RegisterRoutes mounts all data extraction routes on r.
-func (h *ExtractHandler) RegisterRoutes(r chi.Router) {
-	r.Get("/data/executions", h.ListExecutions)
-	r.Get("/data/extract", h.DiscoverTables)
-	r.Get("/data/extract/{table}", h.WindowExtract)
-	r.Get("/data/extract/{table}/current", h.CurrentExtract)
-	r.Post("/data/extract/{table}/reset", h.ResetExtraction)
+// Handler returns an http.Handler with all data extraction routes registered.
+// Mount it under the desired prefix in the host application's router.
+func (h *ExtractHandler) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /data/executions", h.ListExecutions)
+	mux.HandleFunc("GET /data/extract", h.DiscoverTables)
+	mux.HandleFunc("GET /data/extract/{table}", h.WindowExtract)
+	mux.HandleFunc("GET /data/extract/{table}/current", h.CurrentExtract)
+	mux.HandleFunc("POST /data/extract/{table}/reset", h.ResetExtraction)
+	return mux
 }
 
 // WindowExtract handles GET /v1/data/extract/{table}.
@@ -65,7 +67,7 @@ func (h *ExtractHandler) RegisterRoutes(r chi.Router) {
 // incremental changes from {schema}.{table}_log using a moving cursor.
 func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tableName := chi.URLParam(r, "table")
+	tableName := r.PathValue("table")
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
 
@@ -83,7 +85,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if denied {
-		respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "table is not available for extraction"))
 		return
 	}
 
@@ -220,6 +222,8 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
 		return
 	}
+	result.StartAt = &startAt
+	result.EndAt = &endAt
 
 	// Step 9: status transitions.
 	if pageNumber == 1 {
@@ -244,7 +248,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 // CurrentExtract handles GET /v1/data/extract/{table}/current.
 func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tableName := chi.URLParam(r, "table")
+	tableName := r.PathValue("table")
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
 
@@ -262,7 +266,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if denied {
-		respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "table is not available for extraction"))
 		return
 	}
 
@@ -429,7 +433,7 @@ func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) 
 // ResetExtraction handles POST /v1/data/extract/{table}/reset.
 func (h *ExtractHandler) ResetExtraction(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tableName := chi.URLParam(r, "table")
+	tableName := r.PathValue("table")
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
 
@@ -445,7 +449,7 @@ func (h *ExtractHandler) ResetExtraction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if denied {
-		respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "table is not available for extraction"))
 		return
 	}
 
