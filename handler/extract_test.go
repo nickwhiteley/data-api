@@ -14,9 +14,10 @@ type stubAuth struct {
 	tenantID string
 }
 
-func (s stubAuth) Scope(context.Context) string    { return s.scope }
-func (s stubAuth) UserID(context.Context) string   { return s.userID }
-func (s stubAuth) TenantID(context.Context) string { return s.tenantID }
+func (s stubAuth) Scope(context.Context) string         { return s.scope }
+func (s stubAuth) UserID(context.Context) string         { return s.userID }
+func (s stubAuth) TenantID(context.Context) string       { return s.tenantID }
+func (s stubAuth) QueryTenantID(context.Context) string  { return "" } // single-tenant in tests
 
 // stubConfig is a test implementation of DataConfig.
 type stubConfig struct{ lag int }

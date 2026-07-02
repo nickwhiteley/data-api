@@ -68,7 +68,8 @@ func (h *ExtractHandler) Handler() http.Handler {
 func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tableName := r.PathValue("table")
-	tenantID := h.auth.TenantID(ctx)
+	tenantID := h.auth.TenantID(ctx)      // for execution audit records
+	queryTenantID := h.auth.QueryTenantID(ctx) // for WHERE clause; "" = single-tenant (no filter)
 	userID := h.auth.UserID(ctx)
 
 	// Step 1: scope check.
@@ -202,7 +203,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 	// Step 7: run extraction.
 	rows, err := dataextract.ExtractWindow(ctx, h.pool, dataextract.ExtractWindowInput{
 		Schema:     h.schema,
-		TenantID:   tenantID,
+		TenantID:   queryTenantID,
 		TableName:  tableName,
 		RowCount:   rowCount,
 		PageNumber: pageNumber,
@@ -249,7 +250,8 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tableName := r.PathValue("table")
-	tenantID := h.auth.TenantID(ctx)
+	tenantID := h.auth.TenantID(ctx)           // for execution audit records
+	queryTenantID := h.auth.QueryTenantID(ctx) // for WHERE clause; "" = single-tenant (no filter)
 	userID := h.auth.UserID(ctx)
 
 	// Step 1: scope check.
@@ -359,7 +361,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 
 	rows, err := dataextract.ExtractCurrent(ctx, h.pool, dataextract.ExtractCurrentInput{
 		Schema:     h.schema,
-		TenantID:   tenantID,
+		TenantID:   queryTenantID,
 		TableName:  tableName,
 		RowCount:   rowCount,
 		PageNumber: pageNumber,
@@ -400,28 +402,14 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 // Accessible to the required scope (API key) as well as tenant_admin and platform_admin (session auth).
 func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tenantID := h.auth.TenantID(ctx)
-	userID := h.auth.UserID(ctx)
+	queryTenantID := h.auth.QueryTenantID(ctx)
 
-	scope := h.auth.Scope(ctx)
-	if scope != h.requiredScope {
-		// Session-based auth — check role in DB.
-		var role string
-		// #nosec G201 — schema is library-configured, not user input
-		err := h.pool.QueryRow(ctx,
-			fmt.Sprintf(`SELECT role FROM %suser_org
-			 WHERE user_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-			   AND role IN ('data_engineer', 'tenant_admin', 'platform_admin')
-			 LIMIT 1`, h.schema),
-			userID, tenantID,
-		).Scan(&role)
-		if err != nil {
-			respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "access denied"))
-			return
-		}
+	if h.auth.Scope(ctx) != h.requiredScope {
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, h.requiredScope+" scope required"))
+		return
 	}
 
-	tables, err := dataextract.DiscoverTables(ctx, h.pool, h.schema)
+	tables, err := dataextract.DiscoverTables(ctx, h.pool, h.schema, queryTenantID)
 	if err != nil {
 		errlog.Log(ctx, "discover tables", err)
 		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
