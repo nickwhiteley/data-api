@@ -24,6 +24,13 @@ type Config struct {
 	// RequiredScope is the API key scope checked on every extraction request.
 	// Defaults to "data_engineer" if empty.
 	RequiredScope string
+	// MultiTenant enables per-tenant row isolation. When true:
+	//   - extraction queries include WHERE tenant_id = <TenantID from AuthContext>
+	//   - DiscoverTables only lists tables that have a tenant_id column
+	//   - DiscoverTables accepts session-auth fallback for tenant_admin / platform_admin roles
+	// When false (single-tenant), tenant_id is recorded in audit rows but not used to
+	// filter query results, and business tables are not required to have a tenant_id column.
+	MultiTenant bool
 }
 
 // ExtractHandler handles data extraction HTTP requests.
@@ -33,6 +40,7 @@ type ExtractHandler struct {
 	cfg           DataConfig
 	schema        string
 	requiredScope string
+	multiTenant   bool
 }
 
 // NewHandler creates a data extraction handler.
@@ -47,7 +55,14 @@ func NewHandler(pool *pgxpool.Pool, auth AuthContext, cfg DataConfig, config Con
 	if requiredScope == "" {
 		requiredScope = "data_engineer"
 	}
-	return &ExtractHandler{pool: pool, auth: auth, cfg: cfg, schema: schema, requiredScope: requiredScope}
+	return &ExtractHandler{
+		pool:          pool,
+		auth:          auth,
+		cfg:           cfg,
+		schema:        schema,
+		requiredScope: requiredScope,
+		multiTenant:   config.MultiTenant,
+	}
 }
 
 // Handler returns an http.Handler with all data extraction routes registered.
@@ -68,9 +83,13 @@ func (h *ExtractHandler) Handler() http.Handler {
 func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tableName := r.PathValue("table")
-	tenantID := h.auth.TenantID(ctx)      // for execution audit records
-	queryTenantID := h.auth.QueryTenantID(ctx) // for WHERE clause; "" = single-tenant (no filter)
+	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
+	// In single-tenant mode, omit the tenant_id WHERE clause; business tables have no such column.
+	queryTenantID := ""
+	if h.multiTenant {
+		queryTenantID = tenantID
+	}
 
 	// Step 1: scope check.
 	if h.auth.Scope(ctx) != h.requiredScope {
@@ -250,9 +269,12 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tableName := r.PathValue("table")
-	tenantID := h.auth.TenantID(ctx)           // for execution audit records
-	queryTenantID := h.auth.QueryTenantID(ctx) // for WHERE clause; "" = single-tenant (no filter)
+	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
+	queryTenantID := ""
+	if h.multiTenant {
+		queryTenantID = tenantID
+	}
 
 	// Step 1: scope check.
 	if h.auth.Scope(ctx) != h.requiredScope {
@@ -402,11 +424,34 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 // Accessible to the required scope (API key) as well as tenant_admin and platform_admin (session auth).
 func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	queryTenantID := h.auth.QueryTenantID(ctx)
+	tenantID := h.auth.TenantID(ctx)
+	userID := h.auth.UserID(ctx)
+	queryTenantID := ""
+	if h.multiTenant {
+		queryTenantID = tenantID
+	}
 
-	if h.auth.Scope(ctx) != h.requiredScope {
-		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, h.requiredScope+" scope required"))
-		return
+	scope := h.auth.Scope(ctx)
+	if scope != h.requiredScope {
+		if !h.multiTenant {
+			// Single-tenant: all auth is handled externally (e.g. DataAPIGate); no session fallback.
+			respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, h.requiredScope+" scope required"))
+			return
+		}
+		// Multi-tenant: accept session-based access for privileged roles.
+		var role string
+		// #nosec G201 — schema is library-configured, not user input
+		err := h.pool.QueryRow(ctx,
+			fmt.Sprintf(`SELECT role FROM %suser_org
+			 WHERE user_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+			   AND role IN ('data_engineer', 'tenant_admin', 'platform_admin')
+			 LIMIT 1`, h.schema),
+			userID, tenantID,
+		).Scan(&role)
+		if err != nil {
+			respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "access denied"))
+			return
+		}
 	}
 
 	tables, err := dataextract.DiscoverTables(ctx, h.pool, h.schema, queryTenantID)
