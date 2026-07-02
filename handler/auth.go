@@ -10,7 +10,9 @@ type AuthContext interface {
 	Scope(ctx context.Context) string
 	// UserID returns the authenticated user's UUID string.
 	UserID(ctx context.Context) string
-	// TenantID returns the tenant UUID string for the authenticated request.
+	// TenantID returns the tenant UUID string for this request.
+	// In multi-tenant mode it is used both for audit records and as the WHERE tenant_id
+	// filter in extraction queries. In single-tenant mode it is used for audit records only.
 	TenantID(ctx context.Context) string
 }
 

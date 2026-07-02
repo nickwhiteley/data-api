@@ -120,7 +120,9 @@ type AddDenyInput struct {
 }
 
 // AddDeny adds a table to the deny list. Returns ErrDenyConflict if already active.
+// TableName is normalized to the base name (strips _log suffix) before storing.
 func AddDeny(ctx context.Context, pool *pgxpool.Pool, input AddDenyInput) (DenyEntry, error) {
+	input.TableName = normalizeTableName(input.TableName)
 	denyTable := input.Schema + "data_extraction_deny"
 	var e DenyEntry
 	// #nosec G201 — schema is library-configured, not user input
@@ -141,7 +143,9 @@ func AddDeny(ctx context.Context, pool *pgxpool.Pool, input AddDenyInput) (DenyE
 }
 
 // RemoveDeny soft-deletes the deny entry for the given table. Returns ErrNotFound if not active.
+// tableName is normalized to the base name (strips _log suffix) before lookup.
 func RemoveDeny(ctx context.Context, pool *pgxpool.Pool, schema, tableName string) error {
+	tableName = normalizeTableName(tableName)
 	denyTable := schema + "data_extraction_deny"
 	var denyID string
 	// #nosec G201 — schema is library-configured, not user input

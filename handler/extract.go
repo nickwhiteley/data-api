@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	dataextract "github.com/nickwhiteley/data-api/domain"
@@ -25,6 +24,13 @@ type Config struct {
 	// RequiredScope is the API key scope checked on every extraction request.
 	// Defaults to "data_engineer" if empty.
 	RequiredScope string
+	// MultiTenant enables per-tenant row isolation. When true:
+	//   - extraction queries include WHERE tenant_id = <TenantID from AuthContext>
+	//   - DiscoverTables only lists tables that have a tenant_id column
+	//   - DiscoverTables accepts session-auth fallback for tenant_admin / platform_admin roles
+	// When false (single-tenant), tenant_id is recorded in audit rows but not used to
+	// filter query results, and business tables are not required to have a tenant_id column.
+	MultiTenant bool
 }
 
 // ExtractHandler handles data extraction HTTP requests.
@@ -34,6 +40,7 @@ type ExtractHandler struct {
 	cfg           DataConfig
 	schema        string
 	requiredScope string
+	multiTenant   bool
 }
 
 // NewHandler creates a data extraction handler.
@@ -48,16 +55,26 @@ func NewHandler(pool *pgxpool.Pool, auth AuthContext, cfg DataConfig, config Con
 	if requiredScope == "" {
 		requiredScope = "data_engineer"
 	}
-	return &ExtractHandler{pool: pool, auth: auth, cfg: cfg, schema: schema, requiredScope: requiredScope}
+	return &ExtractHandler{
+		pool:          pool,
+		auth:          auth,
+		cfg:           cfg,
+		schema:        schema,
+		requiredScope: requiredScope,
+		multiTenant:   config.MultiTenant,
+	}
 }
 
-// RegisterRoutes mounts all data extraction routes on r.
-func (h *ExtractHandler) RegisterRoutes(r chi.Router) {
-	r.Get("/data/executions", h.ListExecutions)
-	r.Get("/data/extract", h.DiscoverTables)
-	r.Get("/data/extract/{table}", h.WindowExtract)
-	r.Get("/data/extract/{table}/current", h.CurrentExtract)
-	r.Post("/data/extract/{table}/reset", h.ResetExtraction)
+// Handler returns an http.Handler with all data extraction routes registered.
+// Mount it under the desired prefix in the host application's router.
+func (h *ExtractHandler) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /data/executions", h.ListExecutions)
+	mux.HandleFunc("GET /data/extract", h.DiscoverTables)
+	mux.HandleFunc("GET /data/extract/{table}", h.WindowExtract)
+	mux.HandleFunc("GET /data/extract/{table}/current", h.CurrentExtract)
+	mux.HandleFunc("POST /data/extract/{table}/reset", h.ResetExtraction)
+	return mux
 }
 
 // WindowExtract handles GET /v1/data/extract/{table}.
@@ -65,9 +82,14 @@ func (h *ExtractHandler) RegisterRoutes(r chi.Router) {
 // incremental changes from {schema}.{table}_log using a moving cursor.
 func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tableName := chi.URLParam(r, "table")
+	tableName := r.PathValue("table")
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
+	// In single-tenant mode, omit the tenant_id WHERE clause; business tables have no such column.
+	queryTenantID := ""
+	if h.multiTenant {
+		queryTenantID = tenantID
+	}
 
 	// Step 1: scope check.
 	if h.auth.Scope(ctx) != h.requiredScope {
@@ -83,7 +105,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if denied {
-		respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "table is not available for extraction"))
 		return
 	}
 
@@ -200,7 +222,7 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 	// Step 7: run extraction.
 	rows, err := dataextract.ExtractWindow(ctx, h.pool, dataextract.ExtractWindowInput{
 		Schema:     h.schema,
-		TenantID:   tenantID,
+		TenantID:   queryTenantID,
 		TableName:  tableName,
 		RowCount:   rowCount,
 		PageNumber: pageNumber,
@@ -220,6 +242,8 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
 		return
 	}
+	result.StartAt = &startAt
+	result.EndAt = &endAt
 
 	// Step 9: status transitions.
 	if pageNumber == 1 {
@@ -244,9 +268,13 @@ func (h *ExtractHandler) WindowExtract(w http.ResponseWriter, r *http.Request) {
 // CurrentExtract handles GET /v1/data/extract/{table}/current.
 func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tableName := chi.URLParam(r, "table")
+	tableName := r.PathValue("table")
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
+	queryTenantID := ""
+	if h.multiTenant {
+		queryTenantID = tenantID
+	}
 
 	// Step 1: scope check.
 	if h.auth.Scope(ctx) != h.requiredScope {
@@ -262,7 +290,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if denied {
-		respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "table is not available for extraction"))
 		return
 	}
 
@@ -355,7 +383,7 @@ func (h *ExtractHandler) CurrentExtract(w http.ResponseWriter, r *http.Request) 
 
 	rows, err := dataextract.ExtractCurrent(ctx, h.pool, dataextract.ExtractCurrentInput{
 		Schema:     h.schema,
-		TenantID:   tenantID,
+		TenantID:   queryTenantID,
 		TableName:  tableName,
 		RowCount:   rowCount,
 		PageNumber: pageNumber,
@@ -398,10 +426,19 @@ func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) 
 	ctx := r.Context()
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
+	queryTenantID := ""
+	if h.multiTenant {
+		queryTenantID = tenantID
+	}
 
 	scope := h.auth.Scope(ctx)
 	if scope != h.requiredScope {
-		// Session-based auth — check role in DB.
+		if !h.multiTenant {
+			// Single-tenant: all auth is handled externally (e.g. DataAPIGate); no session fallback.
+			respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, h.requiredScope+" scope required"))
+			return
+		}
+		// Multi-tenant: accept session-based access for privileged roles.
 		var role string
 		// #nosec G201 — schema is library-configured, not user input
 		err := h.pool.QueryRow(ctx,
@@ -417,7 +454,7 @@ func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	tables, err := dataextract.DiscoverTables(ctx, h.pool, h.schema)
+	tables, err := dataextract.DiscoverTables(ctx, h.pool, h.schema, queryTenantID)
 	if err != nil {
 		errlog.Log(ctx, "discover tables", err)
 		respond.JSON(w, http.StatusInternalServerError, apierror.New(apierror.CodeInternalError, "internal error"))
@@ -429,7 +466,7 @@ func (h *ExtractHandler) DiscoverTables(w http.ResponseWriter, r *http.Request) 
 // ResetExtraction handles POST /v1/data/extract/{table}/reset.
 func (h *ExtractHandler) ResetExtraction(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tableName := chi.URLParam(r, "table")
+	tableName := r.PathValue("table")
 	tenantID := h.auth.TenantID(ctx)
 	userID := h.auth.UserID(ctx)
 
@@ -445,7 +482,7 @@ func (h *ExtractHandler) ResetExtraction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if denied {
-		respond.JSON(w, http.StatusNotFound, apierror.New(apierror.CodeNotFound, "table not found"))
+		respond.JSON(w, http.StatusForbidden, apierror.New(apierror.CodeForbidden, "table is not available for extraction"))
 		return
 	}
 

@@ -70,15 +70,29 @@ type ExtractCurrentInput struct {
 
 // ExtractCurrent runs a paginated query against {schema}{tableName} (base table, not log).
 // Returns non-deleted rows ordered by primary key for consistent pagination.
+// Table name is double-quoted to handle PostgreSQL reserved words (e.g. "user").
+// When input.TenantID is non-empty, a WHERE tenant_id = $N clause is added to enforce
+// per-tenant row isolation. Leave TenantID empty for single-tenant deployments where
+// business tables have no tenant_id column.
 func ExtractCurrent(ctx context.Context, pool *pgxpool.Pool, input ExtractCurrentInput) (pgx.Rows, error) {
-	table := input.Schema + input.TableName
 	offset := (input.PageNumber - 1) * input.RowCount
+	var query string
+	var args []any
 	// #nosec G201 — tableName validated against information_schema before this call; schema is library-configured.
-	query := fmt.Sprintf(
-		`SELECT * FROM %s WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY %s_id ASC LIMIT $2 OFFSET $3`,
-		table, input.TableName,
-	)
-	rows, err := pool.Query(ctx, query, input.TenantID, input.RowCount, offset)
+	if input.TenantID != "" {
+		query = fmt.Sprintf(
+			`SELECT * FROM %s"%s" WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY "%s_id" ASC LIMIT $2 OFFSET $3`,
+			input.Schema, input.TableName, input.TableName,
+		)
+		args = []any{input.TenantID, input.RowCount, offset}
+	} else {
+		query = fmt.Sprintf(
+			`SELECT * FROM %s"%s" WHERE deleted_at IS NULL ORDER BY "%s_id" ASC LIMIT $1 OFFSET $2`,
+			input.Schema, input.TableName, input.TableName,
+		)
+		args = []any{input.RowCount, offset}
+	}
+	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("extract current %s: %w", input.TableName, err)
 	}
@@ -91,12 +105,28 @@ type TableInfo struct {
 	Description string `json:"description"`
 }
 
-// DiscoverTables returns all {schema} _log tables that have a corresponding base table
-// with a tenant_id column, excluding denied tables and data_extraction_execution_log.
-// The tenant_id requirement excludes platform-wide tables that cannot be safely filtered per-tenant.
-func DiscoverTables(ctx context.Context, pool *pgxpool.Pool, schema string) ([]TableInfo, error) {
+// DiscoverTables returns all {schema} _log tables that have a corresponding base table,
+// excluding denied tables and data_extraction_execution_log.
+// When tenantID is non-empty, an additional JOIN on information_schema.columns ensures
+// only tables that have a tenant_id column are listed — preventing multi-tenant consumers
+// from accidentally extracting data from tables that cannot be safely filtered per-tenant.
+// Pass tenantID as "" for single-tenant deployments where business tables have no tenant_id.
+func DiscoverTables(ctx context.Context, pool *pgxpool.Pool, schema, tenantID string) ([]TableInfo, error) {
 	schemaName := strings.TrimSuffix(schema, ".")
-	rows, err := pool.Query(ctx, `
+
+	// When tenantID is supplied (multi-tenant), only list tables that have a
+	// tenant_id column — prevents accidentally exposing platform-wide tables
+	// that cannot be safely filtered per-tenant.
+	tenantIDJoin := ""
+	if tenantID != "" {
+		tenantIDJoin = `JOIN information_schema.columns tc
+		    ON tc.table_schema = COALESCE(NULLIF($1, ''), current_schema())
+		   AND tc.table_name = regexp_replace(t.table_name, '_log$', '')
+		   AND tc.column_name = 'tenant_id'`
+	}
+
+	// #nosec G201 — schema and tenantIDJoin are library-controlled, not user input.
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
 		SELECT
 		    t.table_name,
 		    COALESCE(obj_description(pc.oid, 'pg_class'), '') AS description
@@ -104,22 +134,19 @@ func DiscoverTables(ctx context.Context, pool *pgxpool.Pool, schema string) ([]T
 		JOIN information_schema.tables base
 		    ON base.table_schema = COALESCE(NULLIF($1, ''), current_schema())
 		   AND base.table_name = regexp_replace(t.table_name, '_log$', '')
-		JOIN information_schema.columns tc
-		    ON tc.table_schema = COALESCE(NULLIF($1, ''), current_schema())
-		   AND tc.table_name = regexp_replace(t.table_name, '_log$', '')
-		   AND tc.column_name = 'tenant_id'
+		%s
 		LEFT JOIN pg_catalog.pg_class pc
 		    ON pc.relname = t.table_name
 		   AND pc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = COALESCE(NULLIF($1, ''), current_schema()))
 		WHERE t.table_schema = COALESCE(NULLIF($1, ''), current_schema())
-		  AND t.table_name LIKE '%_log'
+		  AND t.table_name LIKE '%%_log'
 		  AND t.table_name != 'data_extraction_execution_log'
 		  AND NOT EXISTS (
-		      SELECT 1 FROM ` + schema + `data_extraction_deny d
+		      SELECT 1 FROM %sdata_extraction_deny d
 		      WHERE d.table_name = regexp_replace(t.table_name, '_log$', '')
 		        AND d.deleted_at IS NULL
 		  )
-		ORDER BY t.table_name ASC`, schemaName,
+		ORDER BY t.table_name ASC`, tenantIDJoin, schema), schemaName,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("discover tables: %w", err)
@@ -141,25 +168,40 @@ func DiscoverTables(ctx context.Context, pool *pgxpool.Pool, schema string) ([]T
 
 // ExtractWindow runs a paginated window query against {schema}{tableName}_log.
 // Returns pgx.Rows so the handler can stream-serialise via Serialise().
+// Table name is double-quoted to handle PostgreSQL reserved words (e.g. "user").
+// When input.TenantID is non-empty, a WHERE tenant_id = $N clause is added to enforce
+// per-tenant row isolation. Leave TenantID empty for single-tenant deployments where
+// log tables have no tenant_id column.
 // Caller must close rows.
 func ExtractWindow(ctx context.Context, pool *pgxpool.Pool, input ExtractWindowInput) (pgx.Rows, error) {
-	table := input.Schema + input.TableName + "_log"
 	offset := (input.PageNumber - 1) * input.RowCount
 
+	var query string
+	var args []any
 	// #nosec G201 — tableName validated against information_schema before this call; schema is library-configured.
-	query := fmt.Sprintf(
-		`SELECT * FROM %s
-         WHERE tenant_id = $1
-           AND modified_at >= $2
-           AND modified_at < $3
-         ORDER BY modified_at ASC, %s_log_id ASC
-         LIMIT $4 OFFSET $5`,
-		table, input.TableName,
-	)
-	rows, err := pool.Query(ctx, query,
-		input.TenantID, input.StartAt, input.EndAt,
-		input.RowCount, offset,
-	)
+	if input.TenantID != "" {
+		query = fmt.Sprintf(
+			`SELECT * FROM %s"%s_log"
+             WHERE tenant_id = $1
+               AND modified_at >= $2
+               AND modified_at < $3
+             ORDER BY modified_at ASC, "%s_log_id" ASC
+             LIMIT $4 OFFSET $5`,
+			input.Schema, input.TableName, input.TableName,
+		)
+		args = []any{input.TenantID, input.StartAt, input.EndAt, input.RowCount, offset}
+	} else {
+		query = fmt.Sprintf(
+			`SELECT * FROM %s"%s_log"
+             WHERE modified_at >= $1
+               AND modified_at < $2
+             ORDER BY modified_at ASC, "%s_log_id" ASC
+             LIMIT $3 OFFSET $4`,
+			input.Schema, input.TableName, input.TableName,
+		)
+		args = []any{input.StartAt, input.EndAt, input.RowCount, offset}
+	}
+	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("extract window %s: %w", input.TableName, err)
 	}
